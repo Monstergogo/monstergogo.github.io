@@ -30,7 +30,7 @@ gem install jekyll
 至此Jekyll安装完毕。
 
 ## Chirpy主题
-Jekyll支持众多主题，不同的主题代表了不同的博客风格，可以根据自己喜好，选择不同的模版：[jekyll模版地址](http://jekyllthemes.org/)。chirpy主题ui简单、画面清新，是用来搭建个人博客的不二之选，以下介绍通过chirpy主题搭建个人博客步骤：
+Jekyll支持众多主题，不同的主题代表了不同的博客风格，可以根据自己喜好，选择不同的模版（浏览器搜索关键词：jekyll 主题）。chirpy主题ui简单、画面清新，是用来搭建个人博客的不二之选，以下介绍通过chirpy主题搭建个人博客步骤：
 1. 打开链接：[chirpy-starter](https://github.com/cotes2020/chirpy-starter)并登陆github账号。
 2. 点击按钮Use this template, 选择Create a new repository，创建一个github repository.
    > 注意！repository的名称必须符合格式：USERNAME.github.io，USERNAME表示github用户名
