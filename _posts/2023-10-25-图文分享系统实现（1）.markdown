@@ -39,13 +39,14 @@ mermaid: true
 鉴于在在项目初期以及在满足需求的前提下的运维能力考虑，项目暂时使用MinIO来存储图片。
 ## 时序图
 1. 上传文本、图片时序图
-![avatar](/assets/img/save_post.png)
 
+![avatar](/assets/img/save_post.png)
 2. 分页获取图文信息时序图
+
 ![avatar](/assets/img/post_list.png)
 ## 系统整体架构
 目前整个系统架构相对简单，minio对象存储和mongodb都是在本地通过docker启动，先实现基础功能，架构如下：
-![avatar](/assets/img/beauty_share_service_v0.1.0.png)
+![avatar](/assets/img/beauty_share_service_v0.1.0.jpg)
 ## 效果
 通过工具请求图片上传接口，上传图片到minio, curl示例：
 ```
