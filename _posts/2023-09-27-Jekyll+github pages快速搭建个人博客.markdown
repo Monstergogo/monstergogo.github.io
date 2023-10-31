@@ -47,6 +47,7 @@ Jekyll支持众多主题，不同的主题代表了不同的博客风格，可�
     title:    # 博客主页名称
     tagline:  # 博客主页名称下面的副标题
     github:   # 换成自己的github地址
+    url:      # 博客地址：https://username.github.io，username为github用户名
     ```
     其他的比如twitter地址什么的，按需配置。
 5. 以上编辑保存后，执行命令：

@@ -1,0 +1,86 @@
+---
+title: 图文分享系统（1）
+date: 2023-10-31 13:00:00 +0800
+categories: [系统设计]
+tags: [系统设计, 架构, 微服务]
+author: stephan
+mermaid: true
+---
+## 背景
+金秋十月，天气爽朗，十月的北京落叶枯黄，红叶满山，看到不少朋友周末外出登山，登高望远，美景尽收眼前，肥宅羡慕不已。朋友圈的美景虽美，但数量有限，能看到的美景地点有限，如果有这样一个平台，能看到所有人上传的美景，游山玩水却足不出户，岂不美哉。基于这样的一种愿景，着手开发设计一个美景分享应用- BeautyShare, 本文尝试从零搭建一个最简单的图文分享功能。
+## 基本功能
+1. 平台用户可以上传文字，图片（每次限制9张图片，参考朋友圈）
+2. 可以查看所有用户上传的文字，图片(分页查)
+
+对应的接口列表：
+* 动态新增接口
+* 动态分页查询接口
+
+## 技术选型
+整个后台采用微服务架构，通过docker部署，rpc框架采用gRPC，存储这块，首选需要决定的是关系型数据库还是nosql数据库，由于动态包含文字和图片信息，并且系统目前不涉及关系查询以及考虑到系统后续的数据量的可扩展，nosql数据库是更好的选择。目前市面上的nosql对比：
+
+|名称|优势|适用场景|
+|----|----|----|
+|redis|基于内存，速度快|小量数据缓存，不适合直接用来持久化|
+|hbase|写入速度快，写效率比读效率高，节点易扩展|适用写多读少，海量数据存储的场景|
+|mongodb|文档存储，表结构灵活，读效率比写效率高；支持海量数据存储|表结构经常改变，数据的逻辑结构没又没那么复杂不需要多表查询操作，数据量又比较大的应用场景|
+
+从上可以看到，本项目采用mongodb作为存储更合适。选定了mongodb后，另一个问题：图片直接存储在mongodb还是存储在对象存储？由于图片较多，如果直接存储在mongodb：
+1. 图片资源占用大量存储，不利于后期维护；
+2. 每次读写都需要大量网络资源，读写性能上存在瓶颈；
+
+基于以上原因，图片资源存储到存储桶，mongodb存储图片链接即可。关于开源的对象存储，主要在Ceph和MinIO选择，Ceph和MinIO对比：
+
+|名称|优势|劣势|
+|----|----|----|
+|Ceph|社区活跃,功能强大，高性能、高可用，动态扩容|系统复杂，运维成本高|
+|MinIO|轻量，开箱即用，可存储任意大小对象文件|不支持动态扩容|
+
+鉴于在在项目初期以及在满足需求的前提下的运维能力考虑，项目暂时使用MinIO来存储图片。
+## 时序图
+1. 上传文本、图片时序图
+![avatar](/assets/img/save_post.png)
+
+2. 分页获取图文信息时序图
+![avatar](/assets/img/post_list.png)
+## 系统整体架构
+目前整个系统架构相对简单，minio对象存储和mongodb都是在本地通过docker启动，先实现基础功能，架构如下：
+![avatar](/assets/img/beauty_share_service_v0.1.0.png)
+## 效果
+通过工具请求图片上传接口，上传图片到minio, curl示例：
+```
+curl -i -X POST \
+   -H "Content-Type:multipart/form-data" \
+   -F "files=@\"./手.png\";type=image/png;filename=\"手.png\"" \
+ 'http://localhost:5008/v1/oss/upload'
+```
+上传成功会返回图片链接：
+```json
+{
+    "code": 200,
+    "message": "success",
+    "data": [
+        "http:localhost:9000/photos/1341559194783744.png"
+    ],
+    "traceId": ""
+}
+```
+在minio控制台上可以查看上传的图片：
+![avatar](/assets/img/oss_bucket.png)
+在浏览器上输入图片链接即可预览图片：
+![avatar](/assets/img/oss_object_preview.png)
+
+保存图文和获取图文列表可通过仓库grpc客户端调用：[client地址](https://github.com/Monstergogo/beauty-share/tree/feature/basic_share_server/cmd/client)
+保存到monggo的一些数据：
+![avatar](/assets/img/mongo_find.png)
+
+## 说明
+本博客对应的代码实现地址：[github地址](https://github.com/Monstergogo/beauty-share/tree/feature/basic_share_server)。
+- > 图片上传接口为http接口, 保存图文以及获取图文列表为rpc接口。从上传图片到保存图文目前流程未打通，需要协议转换（http->grpc）,后续会实现。
+{: .prompt-danger }
+- 代码中mongodb和minio地址需要根据自己配置更换，mongodb安装参考：[通过docker快速安装mongodb](https://www.cnblogs.com/linmt/p/17365572.html), minio安装参考：[minio docker安装](https://min.io/download#/docker)。
+- 所有用户的图片都存储在一个存储桶，文件命名通过雪花算法保证有序和唯一，雪花算法参考：[雪花算法go实现](https://www.topgoer.com/%E5%85%B6%E4%BB%96/%E9%9B%AA%E8%8A%B1%E7%AE%97%E6%B3%95.html)。
+## TODO
+1. 日志改成Zap
+2. 协议转换（接网关）
+
