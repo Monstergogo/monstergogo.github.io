@@ -1,0 +1,90 @@
+---
+title: 图文分享系统2:服务注册与发现
+date: 2023-11-9 18:00:00 +0800
+categories: [系统设计]
+tags: [系统设计, 架构, 微服务]
+author: stephan
+mermaid: true
+---
+
+## 背景
+上一篇文章：图文分享系统（1）已经实现了基本的图文上传、查询功能，除了图片上传接口是http外，其他都是grpc接口，客户端在和服务端通信前，需要预先知道服务端ip地址和端口。对于微服务系统来说，客户端如何正确的获取到服务端地址是微服务架构系统中不可缺少的一环，这里也引出来今天要讲述的主角：服务注册与发现。
+
+所谓服务注册，是指在服务正常启动后，将服务名称、服务ip、端口以及其他信息保存起来，供后续使用；服务发现指客户端调用服务端时，通过服务唯一地址，获取到健康实例的ip地址、端口等信息，和后台服务建立连接，实现交互, 关系简单描述如下：
+![avatar](/assets/img/nov/discovery.png)
+
+就是这样的一个简单过程，里面也是有许多问题需要解决，如：服务端注册，注册的信息保存在哪里？已经注册上的，如何保证服务是健康的？同一个服务，如果有多个实例，客户端在发现服务的时候，选择策略是什么样的，等等。
+
+
+## 服务注册与发现组件对比
+对于服务注册与发现，市面上已经有许多开源组件可以直接使用而不用重复开发，常用的有：zookeeper、consul、nacos、etcd，组件对比如下：
+
+|  | zookeeper | consul | nacos | etcd |
+| ---- | ---- | ---- | ---- | ---- |
+| 健康检查 | 长连接 | TCP/HTTP/gRPC | 传输层（ping、tcp）和应用层(http等)健康检查 | 心跳检测 |
+| CAP定理 | CP | CP | CP配置中心；AP: 注册中心 | CP |
+| 多数据中心 | -- | -- | 支持 | 支持 |
+| 负载均衡策略 | -- | Fabio | 权重/metadata/selector | -- |
+| 备注 | 老牌组件，适合数据强一致性的场景 | go写的，英文文档丰富 | java写的，集成spring cloud、k8s、dubbo，阿里开源，社区活跃，文档较全；配置中心和注册中心集成在一起并提供UI管理，对开发来说也是极大的便利 |go开发，支持集群，适合数据量不大的关键数据存储，k8s官方存储组件 |
+
+这里简单说一下CAP定理，C：着数据一致性、A：系统可用性、P：分区可用，比如A系统挂了或者网络问题B访问不了了，对B系统来说，只是访问不了，给出提示即可，并不会导致整个系统的崩溃。
+
+在分布式系统中，CAP三者不可兼得, 要么AP, 要么CP，既要A又要C是不可能保证的。对于服务注册与发现来说，AP特性比CP特性更适用，如果是CP，为了数据一致性，在数据同步的过程中，某些极端情况下可能导致组件暂时的不可用，进而导致系统瘫痪，这种情况在业务上来说是最不想看到的。调研了集中服务注册与发现组件后，发现nacos有以下亮点：
+
+1. 注册中心支持AP，对于注册中心来说更适用。
+2. 支持动态配置，用nacos相当于注册中心+配置中心。
+3. sdk支持go/java等多种语言，中文文档丰富，各种框架集成，好上手。
+4. 性能这块，可以参考官方性能测评：[nacos 2.0服务发现压测报告](https://nacos.io/zh-cn/docs/v2/guide/admin/nacos2-naming-benchmark.html)，只能说绰绰有余。
+
+## 实战
+下面简单说一下beauty-share引入nacos作为服务注册中心以及配置中心的主要步骤:
+
+预先准备：
+- 本地go环境
+- 本地docker环境
+
+具体过程：
+
+1. git clone beauty-share项目:
+   ```shell
+   git clone git@github.com:Monstergogo/beauty-share.git
+   ```
+
+2. 下载完毕，进入项目目录并切换到具体分支：
+   ```shell
+   cd beauty-share && git checkout -b feature/discovery origin/feature/discovery && git pull origin
+   ```
+
+3. 通过docker-compose，启动项目需要的组件如minio、mongodb、nacos等：
+   ```shell
+   cd example && docker compose up -d  
+   ```
+   docker-compose 说明: docker compose一共四个service。
+   minio: 对象存储服务，nacos: 服务注册中心以及配置中心; mysql: nacos依赖mysql作为存储；mongo: beauty-share服务后台存储。
+
+4. 步骤3完成，浏览器输入地址：127.0.0.1:9000, 若服务运行正常，可以看到minio管理登陆页，登陆账号默认root，密码：root1234，成功登陆后，点击左边菜单栏：Buckets，新建一个存储桶：photos并设置访问权限为public：
+![avatar](/assets/img/nov/new_bucket.png)
+
+5. 点击左侧菜单栏：Access Keys，点击Create access key并妥善保存，步骤6中会用到。
+
+6. > 浏览器输入：http://127.0.0.1:8848/nacos, 进入nacos后台管理页面，在beauty-share服务启动前, 需要预先在nacos配置管理设置如下配置:{: .prompt-danger }
+
+    | Data_id           | Group         | 配置内容                                         | 内容格式 |
+    |-------------------|---------------|----------------------------------------------|------|
+    | mongo_uri         | DEFAULT_GROUP | mongodb://root:root123@localhost:27017/share | TEXT |
+    | minio_endpoint    | DEFAULT_GROUP | localhost:9000                               | TEXT |
+    | minio_id          | DEFAULT_GROUP | 步骤5中的access key                            | TEXT |
+    | minio_secret      | DEFAULT_GROUP | 步骤5中的secret key                      | TEXT |
+    | share_bucket_name | DEFAULT_GROUP | 步骤4中新建的存储桶名称：photos                             | TEXT |
+
+   
+   nacos管理平台支持一键导入配置，在管理平台->配置管理->配置列表点击导入配置，选择项目文件夹下：example/conf/DEFAULT_GROUP所有配置导入即可
+
+7. 本地启动beauty-share后台服务，在项目目录执行：`go mod tidy && go run cmd/server/main.go`, 程序正常启动后，在nacos后台管理页面即可看到注册上来的grpc服务地址, 点击详情可查看具体ip、端口等信息：
+![avatar](/assets/img/nov/minio-discovery.png)
+服务下线后会主动注销注册, 调用方在调用前，请求nacos获取服务ip+端口即可与后台服务通信。服务注册具体实现过程请查看
+**代码仓库地址：[beauty-share](https://github.com/Monstergogo/beauty-share/tree/feature/discovery), 分支：feature/discovery**
+
+## todo
+1. 权限校验
+2. 网关接入
