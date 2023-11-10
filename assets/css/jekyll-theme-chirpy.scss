@@ -1,0 +1,18 @@
+---
+---
+
+@import 'main';
+
+/* append your custom style below */
+.table-wrapper>table {
+    width: 100%;
+    table-layout: fixed;
+    overflow: hidden;
+}
+
+.table-wrapper>table tbody tr td, .table-wrapper>table thead th {
+    padding: 0.4rem 1rem;
+    font-size: 95%;
+    white-space: inherit;
+    word-break: break-all;
+}
