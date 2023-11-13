@@ -20,7 +20,7 @@ mermaid: true
 如果没有网关，网关需要做的事情比如权限校验、限流等就需要在各个业务服务上实现，无形增加了系统复杂性和工作量。目前市面上有不少优秀开源网关如nginx、kong、apisix、Envoy。
 
 ## 各大网关介绍
-### ngix
+### nginx
 nginx作为老牌网关，最开始各大厂网关基本上都用nginx来搞的，nginx之所以单机轻松支持10k+的并发，主要依赖于：
 - 异步非阻塞，利用io多路复用，没有线程切换等带来的开销。
 - master+多个worker，多个worker间负载均衡，master监测worker健康状态，在某种情况下可以自动启动新worker继续处理请求。
