@@ -1,0 +1,323 @@
+---
+title: 图文分享系统3：apisix网关-http转grpc、网关接入nacos、网关wolf鉴权
+date: 2023-11-12 23:00:00 +0800
+categories: [系统设计]
+tags: [微服务, apisix, 网关]
+author: stephan
+mermaid: true
+---
+
+## 背景
+前几篇相关文章已经介绍了图文分享系统中一些最基本的功能、服务接口、通过minio存储图片以及nacos做服务注册和配置中心等，基于目前系统状况，我们先来思考几个问题：
+
+1. 用户使用的终端一般都是通过http请求后台接口，目前图文分享系统除了图片上传到minio是http接口，其他比如分页获取图文、图文保存都是grpc接口，如何把http请求转换成grpc请求（协议转换）？
+2. 服务上线，接口如何保护，如何扛住恶性攻击（限流）？
+3. 系统大到一定程度，接口路由非常多，如何集中管理这些路由（路由管理）？
+4. 系统一般需要A/B实验或者灰度，怎样优雅地将流量分发（流量管理）？
+
+带着这样一些问题，引出接下来要介绍的对象：API网关。网关把控着系统流量的入口，在系统中承担着至关重要的角色，是用户请求和后台服务的中间层，主要做后台服务的反向代理。由于是系统的入口，在入口处可以做非常多的事情，比如权限校验、限流、负载均衡，日志监控等等，可以完美解决我们上面提到的问题。
+
+如果没有网关，网关需要做的事情比如权限校验、限流等就需要在各个业务服务上实现，无形增加了系统复杂性和工作量。目前市面上有不少优秀开源网关如nginx、kong、apisix、Envoy。
+
+## 各大网关介绍
+### ngix
+nginx作为老牌网关，最开始各大厂网关基本上都用nginx来搞的，nginx之所以单机轻松支持10k+的并发，主要依赖于：
+- 异步非阻塞，利用io多路复用，没有线程切换等带来的开销。
+- master+多个worker，多个worker间负载均衡，master监测worker健康状态，在某种情况下可以自动启动新worker继续处理请求。
+- 亲cpu, worker可以设置独占cpu资源，减少cpu切换损耗。
+
+虽然nginx具有高性能的特点，仅适合反向代理+静态页面缓存的场景，并且不支持动态配置，配置更改后需要在nginx里面reload。云原生时代，最大的特点就是服务多，系统动态变更，如果还是nginx做为网关，配置变更得手动reload，很明显是难以接受的，因此，微服务/云原生网关层出不穷。
+
+### 云原生网关：Envoy gateway、kong、apisix
+
+#### Envoy gateway
+
+Envoy最早为人所知的是作为云原生的服务治理，在istio服务网格中也能看到envoy的身影。但Envoy gateway是一个可以单独使用的应用网关，envoy gateway的出现是为了降低用户直接采用envoy作为API网关的障碍，从而吸引更多用户关注使用envoy。要提云原生网关，envoy gateway可以算得上是这几个网关里面最云原生的。
+
+envoy gateway的**核心优势**就是**轻量级、高性能、开放、可动态编程**，go语言实现。另外**可以很好地和Envoy打通、配合**，即Envoy Gateway作为应用网关管理**南北流量**，Envoy作为服务网格管理微服务间**东西流量**，打造真正的云原生应用。
+
+**缺点**就是插件通过Lua实现，**上手有一定门槛，可视化管理后台不丰富**。
+
+#### kong 和 apisix
+kong和apisix的底层实现都差不多，基于nginx+lua实现，提供RESTful API和管理API、支持内部和自定义多语言插件、可视化管理页面等等。
+
+kong官方介绍：
+
+**Kong Gateway is a lightweight, fast, and flexible cloud-native API gateway. An API gateway is a reverse proxy that lets you manage, configure, and route requests to your APIs.** 
+
+更多详情请参考github地址：[github: kong](https://github.com/Kong/kong)
+
+apisix是国人开发并捐赠给apache基金会，个人感觉就目前而言，是这几个网关中最不云原生的，不过目前社区活跃，随着后续功能的不断完善，肯定会有不错的发展，目前也有不少优点：
+1. **内置插件丰富**，基本上想要的功能都能通过插件找到，并且支持自定义插件、插件热更新以及各插件的自由组合，**上手简单**。
+2. 采用etcd作为存储，相比kong采用PostgreSQL/Cassandra，利用etcd的订阅可以**毫秒级**捕捉到变更。
+3. **dashboard功能丰富**，中文文档以及社区活跃。
+4. 和kong一样，都是基于nginx+lua，性能上不逊，官网压测单核轻松14k+。
+5. 和各种开源组件打通，鉴权、服务发现、k8s等，应有尽有。
+
+基于以上原因，选择apisix作为beauty-share网关。
+
+## apisix实战
+这里主要是抛砖引玉，通过apsix解决图文系统目前存在的问题，系统中存在如下问题需要解决：
+1. 目前系统还没有权限校验，不是系统用户的也能用。
+2. 协议需要转换：http转grpc。
+3. 服务注册nacos如何和apisix打通。
+
+### 环境要求
+- docker compose
+
+### apisix+wolf实现用户权限校验
+正常系统用户注册登陆后，会有相应的权限模块，基于用户信息或者角色，给予用户一定访问权限，权限模型一般有ACL、RBAC、ABAC：
+
+**ACL**就是每个用户对应有一个资源权限列表，每有一个新用户，都需要增加权限列表，在用户和权限比较多的情况下，权限设置比较繁琐；
+
+**RBAC**在ACL基础上引入了角色的概念，角色对应着具体权限，用户和角色是1:n关系，角色和权限也是1:n的关系，新用户来设置好角色，就具有了相应权限，具有广泛的应用场景；
+
+**ABAC**更加灵活，可以处理一些特殊、动态的需求，比如设置在每天的某个时间段用户可以访问。
+
+开源权限库对比：
+
+||支持的权限模型|优势|缺点|
+|------|------|------|------|
+|casbin| ACL、RBAC、ABAC|高性能、功能强大的访问控制库，支持多种语言|不支持用户校验，专注于登陆后的用户的访问权限校验；不保存用户列表（对正常系统来说并不是问题）；和apsix没有完全打通（poliy文件需要上传到apisix, 非常不现实，感觉像个玩具插件）|
+|wolf|RABC|开箱即用，**认证和授权都有**，提供了功能丰富的**后台管理**，适用于http应用或http restful api；与apisix完全打通|性能相对来说较弱，大型高并发系统可能并不适合|
+
+基于现在系统没有登陆认证以及开发成本，在这里选择在apisix上启用wolf鉴权插件来实现系统权限控制，wolf架构：
+
+![avatar](https://github.com/iGeeky/wolf/blob/master/docs/imgs/architecture.png)
+
+详情请参考：[wolf github地址](https://github.com/iGeeky/wolf/tree/master)
+
+#### 接入wolf鉴权并和apisix打通
+1. `git clone git@github.com:Monstergogo/beauty-share.git`，进入项目目录并切换到分支feature/apisix，分支包含需要的docker-compose.yaml文件。docker-compose server包含11个server：
+    - apisix：网关
+    - apisix-dashboard：网关控制面，可视化后台
+    - apisix-seed：服务注册控制面
+    - etcd：apisix存储
+    - wolf-server：权限
+    - postges：wolf存储
+    - redis：wolf用，缓存作用
+    - nacos：服务发现和配置中心
+    - mysql8：nacos存储
+    - minio：对象存储，用来存储图片
+    - mongodb：后台存储
+
+2. 进入项目的example目录执行以下命令，以容器运行apisix等服务
+   ```shell
+   docker compose up -d
+   ```
+   待所有服务正常启动后，浏览器打开wolf管理后台并登陆:
+   - 地址：[http://127.0.0.1:12180](http://127.0.0.1:12180)
+   - 账号：root
+   - 密码：wolf-123456
+
+3. 新建一个应用、一个测试用户和一个测试角色（自动生成用户名和密码，需妥善保管）；新建用户权限和资源，在资源上配置权限（是否允许访问）并为某个角色分配权限，然后给用户分配角色，这样，新建的用户就具有了具体权限，比如建了一个新应用：share并新建了一个测试用户user-1，具有以下资源的访问权限：
+![avatar](/assets/img/nov/wolf-object.jpg)
+
+4. 下面来操作apisix，认证授权插件需要和apisix中的consumer配合使用，基本概念可以参考官网：[apisix官方文档](https://apisix.apache.org/zh/docs/apisix/terminology/consumer/), cmd通过以下命令新建一个wolf_rbac consumer:
+   ```shell
+   curl http://127.0.0.1:9180/apisix/admin/consumers  \
+    -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+    {
+    "username":"wolf_rbac",
+    "plugins":{
+        "wolf-rbac":{
+        "server":"http://wolf-server:12180",
+        "appid":"share"
+        }
+    },
+    "desc":"wolf-rbac"
+    }'
+   ```
+   其中 server为wolf服务地址，因为docker容器network设置为bridge，容器之间可以通过容器名通信；appid为在wolf管理平台设置的应用id，填写成自己的即可。
+
+5. 启动本地图文服务后(项目运行如果有初始化报错，请在nacos控制台：http://localhost:8848/nacos 上传导入配置：配置在项目目录example/conf/nacos下)，新建一个路由/v1/ping并启用wolf-rbac插件：
+   ```shell
+   curl http://127.0.0.1:9180/apisix/admin/routes/1  \
+    -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+    {
+        "methods": ["GET"],
+        "uri": "/v1/ping",
+        "plugins": {
+            "wolf-rbac": {}
+        },
+        "upstream": {
+            "type": "roundrobin",
+            "nodes": {
+                "host.docker.internal:5008": 1   
+            }
+        }
+    }'
+   ```
+   注意upstream的nodes填写为host.docker.internal:5008，即本地http服务地址，由于apisix是容器启动，服务在本地启动，容器内访问宿主机通过host.docker.internal访问即可。
+
+6. wolf-rbac插件启动时会增加三个接口：
+* /apisix/plugin/wolf-rbac/login
+* /apisix/plugin/wolf-rbac/change_pwd
+* /apisix/plugin/wolf-rbac/user_info
+
+   这些接口需要通过apisix的public-api暴露才能使用，执行以下命令：
+   ```shell
+    curl http://127.0.0.1:9180/apisix/admin/routes/wal-login \
+    -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+    {
+        "uri": "/apisix/plugin/wolf-rbac/login",
+        "plugins": {
+            "public-api": {}
+        }
+    }'
+
+    curl http://127.0.0.1:9180/apisix/admin/routes/wal-user_info \
+    -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+    {
+        "uri": "/apisix/plugin/wolf-rbac/user_info",
+        "plugins": {
+            "public-api": {}
+        }
+    }'
+
+    curl http://127.0.0.1:9180/apisix/admin/routes/wal-change_pwd \
+    -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+    {
+        "uri": "/apisix/plugin/wolf-rbac/change_pwd",
+        "plugins": {
+            "public-api": {}
+        }
+    }' 
+   ```
+7. 到此，就可以登陆并获取wolf toke了, 执行以下命令前**请修改请求参数为自己的**：
+   ```shell
+   curl http://127.0.0.1:9080/apisix/plugin/wolf-rbac/login -i \
+    -H "Content-Type: application/json" \
+    -d '{"appid": "share", "username":"user-1", "password":"user-password", "authType":1}'
+   ```
+   请求参数中，appid为wolf上的应用id, 用户名为测试用户，password为用户密码（新建用户自动生成，改成自己的就行）authType为1表示为密码认证，正常返回用户token:
+![avatar](/assets/img/nov/wolf-token.jpg)
+
+8. 现在开始测试路由/v1/ping：
+   * 缺少token:
+     ```
+     curl http://127.0.0.1:9080/v1/ping -i
+     ```
+     127.0.0.1:9080为apisix网关地址，返回：
+     ```
+     HTTP/1.1 401 Unauthorized
+     Date: XXX
+     Content-Type: text/plain; charset=utf-8
+     Transfer-Encoding: chunked
+     Connection: keep-alive
+     Server: APISIX/3.5.0
+
+     {"message":"Missing rbac token in request"}
+     ```
+   * 将步骤7返回的token放请求头（Authorization）中：
+      ```
+      curl http://127.0.0.1:9080/v1/ping \
+      -H 'Authorization: your-login-toke' -i
+      ```
+      Authorization替换成步骤7返回的token，curl接口后调用本地http服务的ping接口并返回结果：
+     ![avatar](/assets/img/nov/apisix-wolf-ping.png)
+
+    * 在apisix新建路由/v1/test并在wolf控制台新建对应资源/v1/test并设置为所有人禁止访问，会得到以下权限校验信息：
+      ```
+      HTTP/1.1 403 Forbidden
+      Date: XXX
+      Content-Type: text/plain; charset=utf-8
+      Transfer-Encoding: chunked
+      Connection: keep-alive
+      X-UserId: 3
+      X-Username: user-1
+      X-Nickname: melody
+      Server: APISIX/3.5.0
+
+      {"message":"Access failure. resource '/v1/test' is deny all user","username":"user-1","nickname":"melody"}
+      ```
+     
+**至此，服务接入wolf鉴权并与apisix打通已完成**，下面介绍如何通过apisix完成http转grpc，并打通nacos和apisix。
+
+### 利用apisix插件：grpc-transcode实现http转grpc，并通过apisix-seed+nacos实现apisix的服务注册与发现
+先来介绍下几个概念：
+
+grpc-transcode：是apisix内置的一个http协议转grpc协议的插件，具体介绍见官网文档：[grpc-transcode插件介绍](https://apisix.apache.org/zh/docs/apisix/plugins/grpc-transcode/)
+
+nacos: 阿里开源的服务注册和配置中心。
+
+apisix-seed: 服务注册与发现控制面板，将服务发现功能从apisix抽离。
+
+apisix实现服务注册与发现有两种方式：
+- 直接集成到apisix中，如图：
+   ![avatar](/assets/img/nov/apisix-discovery.jpg)
+   服务启动时将信息注册到注册中心，网关从轮训地从注册中心获取信息变更，从而实现服务发现。这样的方式有一些缺点：
+
+   1. 对apisix是侵入是的，扩展新的服务注册中心，需要手动更改apisix配置
+   2. apisix需要缓存注册中心的服务地址信息，占用了不少资源
+   3. 需要和注册中心保持长连接。
+
+- 由于直接集成到apsix中存在以上问题，apisix-seed就是为了解决上面问题而出现的，apisix-seed会根据apsix中upstream配置，根据discovery_type和service_name从注册中心比如nacos拿到服务nodes信息并回写入etcd。apisix-seed会订阅etcd中所有的路由（route）、上游（upstream）、服务（service）配置，根据服务发现类型和服务地址从服务注册中心订阅相关配置变更并写回之etcd，apisix对服务发现无感知。详情请参考：[apisix-seed](https://apisix.apache.org/zh/docs/apisix/discovery/control-plane-service-discovery/)
+
+  感兴趣的可以看下apisix-seed源码：[apisix-seed github地址](https://github.com/api7/apisix-seed)，并不复杂，目前支持nacos和zookeeper。当然也有**缺点**:
+  > 目前apisix-seed并不成熟，在使用apisix-seed过程中发现获取到了服务节点，但回写node到etcd报错问题，后面经过一番折腾才发现apisix的最新版3.6.0给upstream增加了校验，不允许额外自定义一些键写入etcd，apisix 3.5.0和以下版本还是可以的，详细问题可以参考我提的**issues:** [apisix-seed和apisix互通问题](https://github.com/apache/apisix/issues/10479)，应用到线上项目，需要谨慎
+  {: .prompt-warning }
+
+#### 实践：对apisix网关发起http请求，调用后台服务grpc AddShare接口，将文字和图片链接保存到mongodb
+
+前提条件：
+- 在已接入wolf和启动相关服务前提下，即docker compose正常启动了相关服务并接入了wolf鉴权。
+- 本地启动beauty-share后台。
+
+这次实践通过apisix-dashboard操作路由等，步骤：
+1. 浏览器登陆apisix-dashboard：
+   - 地址：[http://localhost:9005](http://localhost:9005)
+   - 账号：admin
+   - 密码：admin
+2. 点击Protocal Buffers -》新建，上传grpc用到的proto文件（项目api/protobuf-sepc目录下），id随便起，内容直接copy share.proto文件里面的内容。
+3. 确保在wolf管理平台已经建好/v1/share/save资源并赋予测试用户权限的前提下，在apisix-dashboard, 点击路由，新建一个路由/v1/share/save，http方法为POST, 点击下一步，上游服务配置为**服务发现**，配置如下：
+![avatar](/assets/img/nov/apisix-http-grpc-trans.jpg)
+
+4. 下一步，开启两个插件：1. wolf-rbac鉴权插件，直接启用就行，无需额外配置；2. grpc-transcode插件，点击启用、内容配置为：
+   ```json
+   {
+    "proto_id": "1",
+    "service": "share.ShareService",
+    "method": "AddShare"
+   }
+   ```
+   service即为grpc service名称，method指具体service下哪个接口，proto_id为步骤2上传的proto的id：
+   ![avatar](/assets/img/nov/apisix-grpc-transcode-config.jpg)
+5. 点击提交后，apisix-seed会立即扑捉到这个路由，并从nacos获取服务信息，比如ip、端口, 回写到etcd并订阅具体注册中心捕捉服务变化，upstream会增加nodes节点，表示当前可用的服务实例ip地址和端口，可以返回路由页面，定位到刚建好的路由，点击查看详情，可以看到nodes信息：
+![avatar](/assets/img/nov/apisix-route-nodes.jpg)
+
+6. 验证接口，向后台grpc接口发起http POST请求:
+   ```shell
+   curl -i -X POST \
+   -H "Content-Type:application/json" \
+   -H "Authorization: your-wolf-token" \
+   -d \
+   '{
+     "post_content": {
+     "text": "http to grpc test",
+     "img": [
+       "http://img.png"]
+    }
+   }' \
+   'http://127.0.0.1:9080/v1/share/save'
+   ```
+   Authorization填写wolf登陆返回的token即可，失效的话需要重新获取：
+   ```shell
+   curl http://127.0.0.1:9080/apisix/plugin/wolf-rbac/login -i \
+    -H "Content-Type: application/json" \
+    -d '{"appid": "share", "username":"user-1", "password":"JJaHpNUdHQeN", "authType":1}'
+   ```
+   **appid、username、password替换成自己的配置**。
+   
+   请求apisix http://127.0.0.1:9080/v1/share/save接口，apisix会自动转成grpc请求，转发到后台服务，成功的话会在mongodb 保存相应的记录，可以登陆mongodb容器验证：`docker exec -it mongodb /bin/bash`
+   进入容器后输入依次执行以下命令：
+   1. `mongosh`
+   2. `use share`
+   3. `db.auth("root", "root123")`
+   4. `db.shares.find()`
+
+   看到新插入的数据即代表成功：
+   ![avatar](/assets/img/nov/mongo-save.jpg)
+   
+
+#### 本博客对应项目地址：[github地址](https://github.com/Monstergogo/beauty-share)；分支：**apisix**

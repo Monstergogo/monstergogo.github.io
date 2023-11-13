@@ -1,8 +1,8 @@
 ---
-title: 图文分享系统2:服务注册与发现
+title: 图文分享系统2：服务注册与发现
 date: 2023-11-8 23:00:00 +0800
 categories: [系统设计]
-tags: [系统设计, 架构, 微服务]
+tags: [微服务, nacos, 服务注册]
 author: stephan
 mermaid: true
 ---
@@ -69,7 +69,7 @@ mermaid: true
 
 5. 点击左侧菜单栏：Access Keys，点击Create access key并妥善保存，步骤6中会用到。
 
-6. > 浏览器输入：http://127.0.0.1:8848/nacos, 进入nacos后台管理页面，在beauty-share服务启动前, 需要预先在nacos配置管理设置如下配置:{: .prompt-danger }
+6. 浏览器输入：http://127.0.0.1:8848/nacos, 进入nacos后台管理页面，在beauty-share服务启动前, 需要预先在nacos配置管理设置如下配置:
 
     | Data_id           | Group         | 配置内容                                         | 内容格式 |
     |-------------------|---------------|----------------------------------------------|------|
@@ -80,7 +80,8 @@ mermaid: true
     | share_bucket_name | DEFAULT_GROUP | 步骤4中新建的存储桶名称：photos                             | TEXT |
 
    
-   nacos管理平台支持一键导入配置，在管理平台->配置管理->配置列表点击导入配置，选择项目文件夹下：example/conf/DEFAULT_GROUP所有配置导入即可
+   > nacos管理平台支持一键导入配置，在管理平台->配置管理->配置列表点击导入配置，选择项目文件夹下：example/conf/nacos下zip文件配置导入即可
+   {: .prompt-warning }
 
 7. 本地启动beauty-share后台服务，在项目目录执行：`go mod tidy && go run cmd/server/main.go`, 程序正常启动后，在nacos后台管理页面即可看到注册上来的grpc服务地址, 点击详情可查看具体ip、端口等信息：
 ![avatar](/assets/img/nov/minio-discovery.png)
