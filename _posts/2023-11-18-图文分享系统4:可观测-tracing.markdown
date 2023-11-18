@@ -1,0 +1,186 @@
+---
+title: 图文分享系统4：可观测性——tracing
+date: 2023-11-18 22:00:00 +0800
+categories: [系统设计]
+tags: [可观测性, otel, jaeger]
+author: stephan
+mermaid: true
+---
+
+## 什么是可观测性
+由于微服务的兴起，项目从开始的大型单体结构拆分成专注于业务功能，职责分明的多个微服务，稍微有点规模的项目微服务个数成百上千，微服务间相互调用，网络通信相当频繁，这也为问题排查带来困难。
+
+可观测性是微服务/分布式系统兴起随之而来的一个产物，越来越多的微服务开发人员迫切需要一个工具能帮助业务快速排查问题，定位问题；能监控整个系统服务各项性能指标，对于一些异常情况能快速告警，通知到相关人员；对于系统的每一项请求，调用经过了哪些服务，耗时情况如何等等；可观测性让我们能从一个外部的视角去理解系统，应用系统通过上报一些信号，其他的一些外部系统接收到信号后做一些处理、转换、存储、提供检索和可视化展示，从而达到掌控系统的目的。
+
+可观测性主要有三大指标信息需要收集，也就是业务系统需要上报的信息：traces(痕迹)、metrics(指标)、logs(日志)：
+- **traces**：traces让我们知道请求之后发生了什么，请求开始到结束，经历了哪些中间件、调用了哪些服务、耗时如何、中间过程有没有异常等等，让我们对整个请求链路有直观的了解。
+- **metrics**: 系统的一些实时仪表数据，通过metrics数据可以知道系统在某个时刻各项数据咋样，可以是cpu、内存利用率；也可以是应用本身的一些比如qps、请求耗时等RED（Request, Error, Duration）数据；通过这些指标提供一个直观的可视化展示并可以设置一些告警从而更好的了解系统可用性/性能等，对系统还是非常重要的。
+- **logs**: 系统日志信息，这个正常系统都会用到。
+
+## opentelemetry、jaeger、otel collector、jaeger collector？傻傻分不清楚
+前面讲到可观测需要三大支柱：tracing、metrics、logging，这些其实对于应用系统来说都是“data”，这些数据通过应用收集，然后上报到其他开源组件比如promethus等，但这里面有许多的问题，数据格式是怎样的，如何上报到其他系统，http? grpc?还是什么，在这之前没有统一标准，导致很多可观测性组件互不兼容，opentelemetry的出现就是为了解决这些问题，在他之前还有opentracing和opencensus，但这两者只解决了部分问题，opentelemetry将两者融合，主要做两个事情：
+- 统一了数据格式，让使用者做自己数据的主导者而不用拘泥于数据格式
+- 通过一些api提供了约定
+
+所以**opentelemetry**的主要工作职责在数据源头-上报这块以及在上报前做一些数据处理，定义了数据格式和统一规范然后让它的下游去进一步消费，和下游消费无关，opentelemetry提供了各个语言的sdk，在日常使用过程中，我们只需要专注于应用要上报的信息而不用再去关注数据的格式应该是怎样组织。此外，有非常多基于opentelemetry的开源组件定义了要上报的数据应该有哪些，使用起来非常方便。
+
+**opentelemetry collector（简称otel collector）**能接收telemetry数据，处理数据然后将数据发送出去，正常数据通过otel sdk到collector，经过collector处理后，再发送到下游，当然，可以直接将数据发送下游而不经过collector，用collector的好处是可以进行数据加工，可以以sidecar的方式部署和业务容器一起部署，这样业务只需要把业务数据发送出去，而不用关心网络问题、发送失败重试等。
+
+**jaeger** 是opentelemetry的下游，可以直接接收otel数据做tracing展示，是Uber开源的分布式链路追踪平台，详情参考官网：[jaeger:open source, distributed tracing platform](https://www.jaegertracing.io/docs/1.50/architecture/)。
+**jaeger collector**的作用和otel collector的功能有重叠，但功能没有otel collector功能那么丰富，jeager collector也可以直接接收telemetry数据，关系如下：
+![avatar](/assets/img/nov/collector.png)
+
+## 图文系统接入jaeger
+下面简单介绍下图文系统接入jaeger的步骤，jaeger通过docker启动，jaeger镜像官方提供了两种：
+- All in one-用于本地测试，快速接入jaeger体验其功能，all in one包括了jaeger ui、jager-collector、jaeger-query等，tracing数据直接存储内存。jaeger query主要用来从存储中查询tracig数据，然后通过jaeger ui展示，jaeger collector用于接收数据，结构如下：
+![avatar](/assets/img/nov/jaeger-architecture-direct2storage.jpg)
+
+all in one中的**db为内存**
+- 分开部署，需要什么安装什么，适合于生产使用。
+
+下面分别介绍两种方式部署。
+### 前置条件
+- docker compose
+
+### 代码层面改动
+1. 通过opentelemetry go sdk，在项目初始化阶段，初始化trace provider，大概代码如下，详细上代码仓库查看：
+   ```go
+   // initTracerProvider Initializes an OTLP exporter, and configures the corresponding trace providers.
+   func initTracerProvider(res *resource.Resource) {
+	ctx := context.Background()
+
+	// replace `localhost` with the endpoint of your cluster. If you run the app inside k8s, then you can
+	// probably connect directly to the service through dns.
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, util.OTLPCollectorGrpcAddr,
+		// Note the use of insecure transport here. TLS is recommended in production.
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		panic(fmt.Errorf("failed to create gRPC connection to collector: %w", err))
+	}
+
+	// Set up a trace exporter
+	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+	if err != nil {
+		panic(fmt.Errorf("failed to create trace exporter: %w", err))
+	}
+
+	// Register the trace exporter with a TracerProvider, using a batch
+	// span processor to aggregate spans before export.
+	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res),
+		sdktrace.WithSpanProcessor(bsp),
+	)
+	otel.SetTracerProvider(tracerProvider)
+
+	// set global propagator to tracecontext (the default is no-op).
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	// Shutdown will flush any remaining spans and shut down the exporter.
+	Shutdowns = append(Shutdowns, tracerProvider.Shutdown)
+	Tracer = otel.Tracer("share")
+    }
+    ```
+
+2. 初始化trace provider后，就可以上报tracing了，我们的目的是追踪所有的请求，在图文系统中请求包括http请求和grpc请求，因此，对于http请求，需要middleware拦截请求，将tracing数据上报，grpc请求通过grpc拦截器上报。拦截器和中间件可以自己写，详情参考相关文档[自定义tracing数据](https://opentelemetry.io/docs/instrumentation/go/manual/)，如果没有什么特殊定制化的数据上报需求，可以直接使用开源的组件上报，在这里也是直接使用开源组件上报，
+
+   gin框架是用的是：otelgin，文档地址：https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin 
+
+   在gin初始化加上这个中间件就行：
+      ```go 
+      ginServer.Use(otelgin.Middleware(util.TracingServiceName))
+      ```
+
+   grpc框架使用的是：otelgrpc，文档地址：https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc
+
+   grpc初始化加上：
+      ```go
+      srv := grpc.NewServer(grpc.UnaryInterceptor(reqLogInterceptor()),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()))
+      ```
+
+   系统存储主要用的mongodb，tracing也有相应的上报框架：otelmongo，文档地址：https://github.com/uptrace/opentelemetry-go-extra/tree/main/example/mongo-driver
+
+   同样在mongo初始化加上：
+      ```go
+      opt := options.Client()
+	  opt.Monitor = otelmongo.NewMonitor()
+	  opt.ApplyURI(mongoUri)
+	  client, err := mongo.Connect(ctx, opt)
+      ```
+
+   **具体参考github代码**
+
+
+### 通过docker compose启动jaeger
+1. clone代码：
+    ```
+    git clone git@github.com:Monstergogo/beauty-share.git
+    ```
+2. 代码在分支feature/tracing，需要本地新建分支，与之关联并拉取最行代码。
+3. docker compose启动系统需要的组件，如apisix、mongodb等，进入项目目录执行以下命令：
+    ```shell
+    cd example && docker compose up -d
+    ```
+正常启动后，需要在nacos控制台导入图文系统启动需要的配置文件，具体参考之前文章。
+
+> 由于用到了jaeger SPM(Service Performance Monitoring)来查看服务的一些关键性指标，在docer-compose文件用到了prometheus和otel collector，tracing数据先进入otel collector，通过spanmetrics connector抽取metric数据存入prometheus，然后jaeger ui展示metrics数据，具体如下：
+![avatar](/assets/img/nov/jaeger-spm.jpg)
+详情参考：[jaeger SPM](https://www.jaegertracing.io/docs/1.50/spm/)
+ {: .prompt-warning }
+#### all-in-one镜像快速接入jaeger:
+- 预先准备好了docker-compose文件，cmd进入项目example/observability目录，执行docker-compose命令：
+   ```shell
+   docker compose -f docker-compose-all-in-one.yml up -d
+   ```
+- 启动本地服务，服务入口：cmd/server/main.go
+- cmd请求接口（**预先在apisix创建**）：
+   分页获取图文详情接口（http转grpc）：
+   ```
+   curl http://127.0.0.1:9080/grpc/test\?page_size\=10
+   ```
+
+   ping接口
+   ```
+   curl http://127.0.0.1:9080/v1/ping  
+   ```
+   多请求几次
+
+- 浏览器打开jaeger ui，地址：http://localhost:16686/search，选择service，即可查看tracing信息如图:
+![avatar](/assets/img/nov/jaeger-tracing.jpg)
+点开具体tracing可查看调用链路，如:
+![avatra](/assets/img/nov/jaeger-tracing-detail.jpg)
+![avatra](/assets/img/nov/jaeger-tracing-detail-2.jpg)
+![avatra](/assets/img/nov/jaeger-tracing-detail-1.jpg)
+
+  http接口：
+ ![avatra](/assets/img/nov/jaeger-tracing-detail-http.jpg)
+**可以看到这个接口，调用了grpc接口，然后在mongodb查询了相关数据**
+
+- monitor数据如下（**实验性功能，目前并不完善，metric展示还是以prometheus为准**）展示以下系统关键数据(RED数据)：
+  ![avatra](/assets/img/nov/jaeger-spm-ui.jpg)
+
+
+#### jaeger组件单独安装
+由于all-in-one镜像是为了体验用的，并不能用于实际生产环境，按照官方的做法如下：
+![avatar](/assets/img/nov/jaeger-architecture-kafka.jpg)
+
+数据到jaeger collctor后，collector将数据写入kafka，然后通过jaeger intester异步消费数据并存入db，jaeger query从db查询数据，然后做展示。
+
+引入kafaka后，ingester异步消费，可以一定程度上避免消息丢失。
+
+**DB在这里使用elasticsearch做存储**，也是官方推荐的存储，使用es做存储的原因是因为es有强大的检索能力，虽然单个写入并没有cassandra强，但在tracing数据写入cassandra同时，还需要额外写入一些索引信息，而es是一次性写入的，所以总体写入性能并不比使用cassandra差。
+
+**同样的和all-in-one部署的步骤一样，唯一不一样的是docker-compose文件不一样，单独安装的docker-compose文件在example/observability/docker-compose.yml**，docker compose里面的服务不再介绍了，运行直接`docker compose up -d`，如果all-in-one容器还在运行，先`compose -f docker-compose-all-in-one.yml down`停掉之前的相关服务。
+
+
+#### 对应代码仓库：[github仓库](https://github.com/Monstergogo/beauty-share)， 分支：feature/tracing
+  
+
+  
+
