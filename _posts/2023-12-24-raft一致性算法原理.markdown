@@ -1,0 +1,339 @@
+---
+title: raft一致性算法原理以及源码分析
+date: 2023-12-24 22:00:00 +0800
+categories: [原理]
+tags: [raft, 分布式一致性算法]
+author: stephan®
+mermaid: true
+---
+
+## 前言
+etcd是k8s中采用的分布式存储库，用来存储k8s中一些关键信息，具有高可用，实时动态捕捉变更，提供高效可靠服务等特性。etcd提供CAP中CP能力也就是强一致性和分区可用性，不同于zookeeper，etcd多个节点间是通过raft算法来实现数据的强一致性的，raft算法论文地址：[raft算法](https://raft.github.io/raft.pdf)），下面是对论文中的部分内容以及raft go实现源码进行简单总结。
+
+## raft算法中的角色
+Raft将系统中的角色分为领导者（Leader）、跟从者（Follower）和候选人（Candidate）：
+- Leader：接受客户端请求，并向Follower同步请求日志，当日志同步到大多数节点上后告诉Follower提交日志。
+- Follower：接受并持久化Leader同步的日志，在Leader告之日志可以提交之后，提交日志。
+- Candidate：Leader选举过程中的临时角色。
+
+各角色转换如下图：
+![avatar](/assets/img/nov/raft-role-trans.png)
+1. 开始时都是Follwer。
+2. Follower会**随机等待一段时间（避免多个follower同时变成candidate）**，如果时间内没有收到Leader发送的心跳，则从follower转变成candidate并发起Leader选举投票。
+3. 如果candidate发起Leader选举后有超过集群半数的赞成，则从candidate变成Leader，如果选举过程中有其他节点已经成为Leader，则直接转变成follower。
+4. Leader会周期性发送心跳给Follower节点，证明自己存活。
+
+## raft节点状态
+在介绍详细算法之前，先了解下各节点需要保存的状态，如下图：
+![avatar](/assets/img/nov/raft-state.jpg)
+- currentTerm是当前节点所处的term，初始化为0，每次选举的时候加1，新数据都是在Leader的某个term内产生的，Leader在和其他Follower做数据同步时，通过对比数据的term来判断数据是否一致，term的作用会在后面详细讲解。
+- log[]数组，这个数组保存了日志条目，一个日志包含具体命令以及数据产生时所处的term，Leader接收client请求，首先将请求保存到log，然后将log同步到其他follower节点，当超过半数节点返回同步成功，Leader节点执行请求并告知其他follower执行具体命令。
+- commitIndex表示的是当前节点已经commit的位置。
+- lastApplied表示的是上次apply的位置。
+- nextIndex[]和matchIndex[]数组**只在Leader中有**，nextIndex[]数组记录了每个Follower节点下次要同步数据的开始下标，默认开始时为Leader的log长度，Leader会不断重试找到每个follower需要同步的数据位置。
+- matchIndex[]数组用来表示已经同步过log的位置，初始化的时候位置为0。
+
+## raft go源码实现解析
+### 源码总体视角
+首先看下一个简单的raft结构体：
+```go
+type Raft struct {
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+
+	// Your data here (2A, 2B, 2C).
+	// Look at the paper's Figure 2 for a description of what
+	// state a Raft server must maintain.
+	currentTerm int
+	votedFor    int
+	logs        []LogEntry
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	nextIndex  []int
+	matchIndex []int
+
+	voteCount     int
+	state         uint64
+	granted       chan struct{}
+	AppendEntries chan struct{}
+	electWin      chan struct{}
+	applyCh       chan ApplyMsg
+}
+```
+mu用来确保并发安全；peers维持了每个节点信息，用于节点间通信；me用来记录当前节点在集群中的index，其他字段基本和介绍的state状态基本一致，不再累述。
+
+启动入口：
+```go
+func (rf *Raft) run() {
+	for {
+            switch rf.state {
+                case StateCandidate:
+                    select {
+                    // 超时，再重试一遍
+                    case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)):
+                        rf.mu.Lock()
+                        rf.becomeCandidate()
+                        rf.mu.Unlock()
+                    case <-rf.AppendEntries:
+                        rf.mu.Lock()
+                        rf.becomeFollower("candidate receive heart beat")
+                        rf.mu.Unlock()
+                    case <-rf.electWin:
+                        rf.mu.Lock()
+                        rf.becomeLeader()
+                        rf.mu.Unlock()
+                    }
+                case StateFollower:
+                    select {
+                    // 收到投票请求
+                    case <-rf.granted:
+                    // 收到心跳请求
+                    case <-rf.AppendEntries:
+                    case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)):
+                        rf.mu.Lock()
+                        rf.becomeCandidate()
+                        rf.mu.Unlock()
+                    }
+                case StateLeader:
+                    go rf.sendAppendEntries()
+                    time.Sleep(time.Millisecond * 100)
+                }
+	}
+}
+```
+run方法通过一个for循环，根据节点的角色进行不同的逻辑处理，**raft初始角色为Follower**，也就是代码中的StateFollower，从StateFollower的case可以看出**Follower节点的主要工作**：
+- 处理Condidate的投票请求，参与Leader选举。
+- 接收Leader的心跳请求，确保集群中Leader存活。
+- 随机等待一小段时间，如果没有收到任何请求，则将角色变成Candidate，竞选Leader。
+
+becomeCandidate代码如下：
+```go
+func (rf *Raft) becomeCandidate() {
+	rf.state = StateCandidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.voteCount = 1
+	rf.persist()
+	go rf.sendAllVotesRequests()
+}
+```
+成为Candidate状态，除了将状态更改外，需要将term++并率先投自己一票（rf.voteCount = 1）并将节点当前的term，logs, voteFor数据持久化（rf.persist()）, rf.sendAllVotesRequests()方法是用来发起投票的rpc接口，代码如下：
+```go
+func (rf *Raft) sendAllVotesRequests() {
+	rf.mu.Lock()
+	// 投票的参数
+	args := &RequestVoteArgs{}
+	args.Term = rf.currentTerm
+	args.CandidateId = rf.me
+	// args.LastLogIndex = rf.getLastIndex()
+	// args.LastLogTerm = rf.getLastTerm()
+	rf.mu.Unlock()
+
+	var wg sync.WaitGroup
+
+	for p := range rf.peers {
+		if p != rf.me {
+			wg.Add(1)
+			go func(p int) {
+				defer wg.Done()
+
+				ok := rf.sendRequestVote(p, args, &RequestVoteReply{})
+				if !ok {
+					rf.debug("send request to p: %d, ok: %v", p, ok)
+				}
+
+			}(p)
+		}
+	}
+	wg.Wait()
+
+	rf.mu.Lock()
+	// 等待结果返回，如果符合quorum协议，则投票成功
+	win := rf.voteCount >= len(rf.peers)/2+1
+	// make sure the vote request is valid
+	if win && args.Term == rf.currentTerm {
+		rf.electWin <- struct{}{}
+	}
+	rf.mu.Unlock()
+}
+
+
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	respCh := make(chan bool)
+	ok := false
+	go func() {
+		respCh <- rf.peers[server].Call("Raft.RequestVote", args, reply)
+	}()
+	select {
+	case <-time.After(time.Millisecond * 60): // 1s
+		return false
+	case ok = <-respCh:
+	}
+	if !ok {
+		return false
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	if rf.state != StateCandidate || args.Term != rf.currentTerm {
+		return ok
+	}
+	// 当前term较小了
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower("candidate received large term")
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	if reply.VoteGranted {
+		rf.voteCount++
+	}
+	return ok
+}
+```
+代码中可以看到，Candidate发起Leader选举会将当前Candidate的term以及Candidate节点id发送给集群中所有节点，其他节点进行投票，待投票完成，统计赞成数，如果大于集群节点数量的一半，则选举Leader成功，将角色改成Leader。sendRequestVote方法是发送具体请求的方法，如果请求超时会直接返回false，如果其他返回的Term大于Candidate的Term数据当前节点的数据落后，直接变成Follower。
+
+
+## 日志（数据）同步
+下面来看下Leader的sendAppendEntries方法，该方法用来发送心跳（数据为空）或者同步log，是**数据同步最重要的一步**:
+```go
+func (rf *Raft) sendAppendEntries() {
+	var wg sync.WaitGroup
+
+	rf.mu.RLock()
+	for p := range rf.peers {
+		if p != rf.me {
+			args := &RequestAppendEntriesArgs{}
+			// 发送leader term
+			args.Term = rf.currentTerm
+			// leader ID
+			args.LeaderID = rf.me
+			// 日志同步需要用到的 leader 选举暂时用不到
+			args.PrevLogIndex = rf.nextIndex[p] - 1
+			args.LeaderCommit = rf.commitIndex
+          
+			if args.PrevLogIndex >= 0 {
+				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+			}
+			// 发送空数据
+			if rf.nextIndex[p] <= rf.getLastIndex() {
+				args.Entries = rf.logs[rf.nextIndex[p]:]
+			}
+			//rf.debug("send Entries is: %v, index is: %d", args.Entries, p)
+			wg.Add(1)
+
+			go func(p int, args *RequestAppendEntriesArgs) {
+				defer wg.Done()
+				ok := rf.sendRequestAppendEntries(p, args, &RequestAppendEntriesReply{})
+				if !ok {
+					rf.debug("send %d AppendEntries result:%v", p, ok)
+				}
+			}(p, args)
+		}
+	}
+	rf.mu.RUnlock()
+	wg.Wait()
+}
+
+func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
+	respCh := make(chan bool)
+	ok := false
+	go func() {
+		respCh <- rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
+	}()
+
+	select {
+	case <-time.After(time.Millisecond * 60): // 100ms
+		return false
+	case ok = <-respCh:
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if !ok || rf.state != StateLeader || args.Term != rf.currentTerm {
+		return ok
+	}
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower("leader expired")
+		rf.currentTerm = reply.Term
+		rf.persist()
+		return ok
+	}
+	//rf.debug("rf matchIndex is %v", rf.matchIndex)
+	if reply.Success {
+
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		//rf.debug("reply success, server is %d, matchIndex is %d", server, rf.matchIndex[server])
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+		go rf.commit()
+	} else {
+		rf.nextIndex[server] = reply.RetryIndex
+	}
+
+	return ok
+}
+```
+
+逻辑也比较简单，主要是给集群中其他节点发送rpc请求，将Leader当前term、记录peer已同步log index和log term，以及最重要的:要同步的log数据list，将这些数据作为入参; 如果peer成功返回的话，需要调用rf.commit()方法，更新commitIndex以及apply信息，如果同步接口返回不等于reply.Success的话，更新节点nextIndex的位置为返回的值，告知Leader同步节点要同步的数据开始位置。
+
+appendEntries接收方（follower）接收到Leader的appendEntries请求，处理逻辑如下：
+```go
+func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.AppendEntries <- struct{}{}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		if rf.state != StateFollower {
+			rf.becomeFollower("request append receive large term")
+			rf.votedFor = -1
+		}
+	}
+
+	// which means the request need to decrease the index and send request again
+	if args.PrevLogIndex > rf.getLastIndex() {
+		reply.RetryIndex = rf.getLastIndex() + 1
+		return
+	}
+	// 这里使用retry index 其实是一个优化点
+	// paper 里面是每次自减，回复一个false，这里直接找到下一个term的位置
+	// 减少了心跳包的发送次数
+	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		for reply.RetryIndex = args.PrevLogIndex - 1;
+			reply.RetryIndex > 0 && rf.logs[reply.RetryIndex].Term == rf.logs[args.PrevLogIndex].Term;
+		reply.RetryIndex-- {
+		}
+		return
+	}
+	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+	//rf.debug("args.LeaderCommit is :%d, PrevLogIndex %d, commitIndex: %d", args.LeaderCommit, args.PrevLogIndex, rf.commitIndex)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(rf.getLastIndex(), args.LeaderCommit)
+		go rf.applyLog()
+	}
+	reply.Success = true
+}
+```
+follower根据Leader的term和log的term进行一些逻辑处理，`rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)`将follower的log进行截取并加上leader同步过来的log数据，通过这样的方式确保数据一致。
+
+
+## 总结
+1. raft算法集群中任何时候只存在一个Leader，负责处理client端请求并将数据同步到其他节点。
+2. 每个Leader期间都对应一个唯一的term，通过这个唯一的term可以用来判定数据是否一致以及确保在选举Leader时，选举成功的Leader一定是集群中数据最全的节点。
+3. Follower在同步Leader log数据时，通过对比需要同步的log index term来判定数据是否要更新，哪些数据需要摒弃，更新的起点位置，从而确保follower数据和leader数据始终时一致的。
