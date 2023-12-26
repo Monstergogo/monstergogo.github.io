@@ -3,12 +3,12 @@ title: raft一致性算法原理以及源码分析
 date: 2023-12-24 22:00:00 +0800
 categories: [原理]
 tags: [raft, 分布式一致性算法]
-author: stephan®
+author: stephan
 mermaid: true
 ---
 
 ## 前言
-etcd是k8s中采用的分布式存储库，用来存储k8s中一些关键信息，具有高可用，实时动态捕捉变更，提供高效可靠服务等特性。etcd提供CAP中CP能力也就是强一致性和分区可用性，不同于zookeeper，etcd多个节点间是通过raft算法来实现数据的强一致性的，raft算法论文地址：[raft算法](https://raft.github.io/raft.pdf)），下面是对论文中的部分内容以及raft go实现源码进行简单总结。
+etcd是k8s中采用的分布式存储库，用来存储k8s中一些关键信息，具有高可用，实时动态捕捉变更，提供高效可靠服务等特性。etcd提供CAP中CP能力也就是强一致性和分区可用性，不同于zookeeper，etcd多个节点间是通过raft算法来实现数据的强一致性的，raft算法论文地址：[raft算法](https://raft.github.io/raft.pdf)，下面是对论文中的部分内容以及raft go实现源码进行简单总结。
 
 ## raft算法中的角色
 Raft将系统中的角色分为领导者（Leader）、跟从者（Follower）和候选人（Candidate）：
@@ -202,7 +202,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 代码中可以看到，Candidate发起Leader选举会将当前Candidate的term以及Candidate节点id发送给集群中所有节点，其他节点进行投票，待投票完成，统计赞成数，如果大于集群节点数量的一半，则选举Leader成功，将角色改成Leader。sendRequestVote方法是发送具体请求的方法，如果请求超时会直接返回false，如果其他返回的Term大于Candidate的Term数据当前节点的数据落后，直接变成Follower。
 
 
-## 日志（数据）同步
+### 日志（数据）同步
 下面来看下Leader的sendAppendEntries方法，该方法用来发送心跳（数据为空）或者同步log，是**数据同步最重要的一步**:
 ```go
 func (rf *Raft) sendAppendEntries() {
