@@ -11,7 +11,7 @@ mermaid: true
 日常开发过程中，随着业务的发展，传统关系如mysql可能不太能起支撑庞大的业务数据，当数据库遇到瓶颈时，传统的解决方案比如通过工具进行**分库分表**，分库分表的主要问题在于**分库分表后数据查询困难、成本大、可扩展性弱等**，基于这样的一些难题，**分布式数据库**开始慢慢进入大众视野。
 
 TiDB是一款同时支持在线事务处理与在线分析处理(Hybrid Transactional and Analytical Processing, HTAP)的融合型分布式数据库产品，具备水平扩容或者缩容、金融级高可用、实时 HTAP、云原生的分布式数据库、兼容 MySQL5.7协议和MySQL生态等重要特性。目标是为用户提供一站式OLTP(Online Transactional Processing)、OLAP(Online Analytical Processing)、HTAP解决方案。TiDB 适合高可用、强一致要求较高、数据规模较大等各种应用场景。
-官网地址：(TiDB)[https://docs.pingcap.com/zh/tidb/stable/overview], 代码仓库：[TiDB repo](https://github.com/pingcap/tidb/tree/master)
+官网地址：[TiDB](https://docs.pingcap.com/zh/tidb/stable/overview), 代码仓库：[TiDB repo](https://github.com/pingcap/tidb/tree/master)
 
 从介绍上看着就很牛逼，**一个db搞定oltp/olap、单集群容量支持PB级别，满足金融级别高可用**，下面我们简单介绍下TiDB的具体实现，主要回答几个问题：
 1. TiDB如何实现高可用
@@ -19,6 +19,7 @@ TiDB是一款同时支持在线事务处理与在线分析处理(Hybrid Transact
 
 ## TiDB如何实现高可用
 分布式高可用无非就是数据备份，多个实例，数据备份这块TiDB通过Multi-Raft协议同步事务日志，多数派写入成功事务才能提交，确保数据强一致性且少数副本发生故障时不影响数据的可用性，系统集群部署，整体架构如下：
+
 ![avatar](/assets/img/jan/tidb.png)
 
 可以看到整个架构中的组件都是**集群部署**，多实例允许部分服务宕机从而确保高可用，其中：
