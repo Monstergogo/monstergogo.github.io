@@ -1,0 +1,113 @@
+---
+title: TiDB实践及底层探析
+date: 2024-01-30 22:00:00 +0800
+categories: [原理]
+tags: [TiDB, 分布式数据库, 高可用]
+author: stephan
+mermaid: true
+---
+
+## TiDB简介
+日常开发过程中，随着业务的发展，传统关系如mysql可能不太能起支撑庞大的业务数据，当数据库遇到瓶颈时，传统的解决方案比如通过工具进行**分库分表**，分库分表的主要问题在于**分库分表后数据查询困难、成本大、可扩展性弱等**，基于这样的一些难题，**分布式数据库**开始慢慢进入大众视野。
+
+TiDB是一款同时支持在线事务处理与在线分析处理(Hybrid Transactional and Analytical Processing, HTAP)的融合型分布式数据库产品，具备水平扩容或者缩容、金融级高可用、实时 HTAP、云原生的分布式数据库、兼容 MySQL5.7协议和MySQL生态等重要特性。目标是为用户提供一站式OLTP(Online Transactional Processing)、OLAP(Online Analytical Processing)、HTAP解决方案。TiDB 适合高可用、强一致要求较高、数据规模较大等各种应用场景。
+官网地址：(TiDB)[https://docs.pingcap.com/zh/tidb/stable/overview], 代码仓库：[TiDB repo](https://github.com/pingcap/tidb/tree/master)
+
+从介绍上看着就很牛逼，**一个db搞定oltp/olap、单集群容量支持PB级别，满足金融级别高可用**，下面我们简单介绍下TiDB的具体实现，主要回答几个问题：
+1. TiDB如何实现高可用
+2. TiDB如何做到高性能
+
+## TiDB如何实现高可用
+分布式高可用无非就是数据备份，多个实例，数据备份这块TiDB通过Multi-Raft协议同步事务日志，多数派写入成功事务才能提交，确保数据强一致性且少数副本发生故障时不影响数据的可用性，系统集群部署，整体架构如下：
+![avatar](/assets/img/jan/tidb.png)
+
+可以看到整个架构中的组件都是**集群部署**，多实例允许部分服务宕机从而确保高可用，其中：
+1. TiDB Server(TiDB cluster)：对外暴露 MySQL 协议的连接 endpoint，负责接受客户端的连接，执行 SQL 解析和优化，最终生成分布式执行计划。TiDB 层本身是无状态的，实践中可以启动多个 TiDB 实例，通过负载均衡组件（如 LVS、HAProxy 或 F5）对外提供统一的接入地址，客户端的连接可以均匀地分摊在多个 TiDB 实例上以达到负载均衡的效果。TiDB Server 本身并不存储数据，只是解析 SQL，将实际的数据读取请求转发给底层的存储节点 TiKV（或 TiFlash）。
+2. PD (Placement Driver) Server: 整个 TiDB 集群的元信息管理模块，负责存储每个 TiKV 节点实时的数据分布情况和集群的整体拓扑结构，提供 TiDB Dashboard 管控界面，并为分布式事务分配事务 ID。PD 不仅存储元信息，同时还会根据 TiKV 节点实时上报的数据分布状态，下发数据调度命令给具体的 TiKV 节点，可以说是整个集群的“大脑”。此外，PD 本身也是由至少 3 个节点构成，拥有高可用的能力。建议部署奇数个 PD 节点。
+3. TiKV Server: 责存储数据，从外部看 TiKV 是一个分布式的提供事务的 Key-Value 存储引擎。TiDB数据最终是落到TiKV持久化，TiDB会将数据映射成一定规则的key存储到TiKV中，具体映射关系可以看看官网：[TiDB数据映射](https://docs.pingcap.com/zh/tidb/stable/tidb-computing)
+
+## TiDB如何实现高性能
+TiDB高性能主要是计算和存储分离，存储组件只管简单计算和存储，复杂/耗时的查询通过列式存储来做（列式存储适合olap场景，并且在TiDB的列式存储中，采用了计算和存储分离的架构，可以根据业务场景调整资源，充分利用资源从而实现快速查询），另外，就算不使用列式存储，一些场景下TiDB上的查询也会比普通的存储引擎快，主要得益于：
+1. TiDB的分布式架构以及数据Region分区
+2. TiDB使用Multi-raft算法来做分布式一致，通过多个raft-group来同步数据，可以将读写压力分离
+3. PD自动分片和调度
+
+TiDB的存储TiKV将数据分成多个region（几十兆大小），一个region是存储的是连续key-value, TiDB会确保每个节点上的region数量均衡，因此，一个表的数据分布到集群的多个节点上，查询数据时，相当于将查询切分成多个小的查询分摊到集群的多个节点上，极大缩短查询时间；
+另外，相比于raft算法，multi-raft在分布式场景具有更高的性能，raft算法读写都在leader，leader压力很大，而Multi-raft算法，一个group就有一个leader, 多个group有多个Leader能接收读写从而提高读写效率和系统的吞吐；
+除此之外，通过PD调度器，可以自动将热点数据转移到集群其他节点/均衡集群阶段数据量等，一系列措施让TiDB具有更好的性能。
+
+
+## 简单实践
+官方准备了一些测试数据可以用来测试TiDB, 首先在本地部署测试集群，按照官网步骤：[安装TiDB本地测试集群](https://docs.pingcap.com/zh/tidb/stable/quick-start-with-tidb#%E9%83%A8%E7%BD%B2%E6%9C%AC%E5%9C%B0%E6%B5%8B%E8%AF%95%E9%9B%86%E7%BE%A4)
+安装完成后：
+
+1. 终端输入`tiup playground`启动本地集群
+2. 步骤1正常启动后，新起一个终端输入`tiup install bench`，命令会将一些测试数据导入TiDB
+3. 连接TiDB，个人更喜欢工具连接DB，这里通过DataGrip工具连接TiDB，首先需要创建一个账号，`tiup client`连接数据库(官方提供的命令行工具)，输入`CREATE USER 'tiuser'@'localhost' IDENTIFIED BY '123456';`授权用户，并通过命令`GRANT SELECT ON test.* TO 'tiuser'@'localhost';`将test库下所有表授权给tiuser，这样，就可以通过DataGrip连接TiDB了，正常连接可以如下看到8张表：
+![avatar](/assets/img/jan/test_data.jpg)
+
+通过以上步骤TiDB本地集群以及测试数据已经成功导入了，TiDB提供了dashboard，通过dashboard可以直观查看TiDB集群状态/查询耗时等信息，dashboard地址：http://127.0.0.1:2379/dashboard, 账号root,密码为空，浏览器打开可以看到如下页面：
+![avatar](/assets/img/jan/tidb_dashboard.jpg)
+
+### TiDB查询简单测试
+基于测试数据，查询sql如下：
+```sql
+SELECT
+    l_orderkey,
+    SUM(
+        l_extendedprice * (1 - l_discount)
+    ) AS revenue,
+    o_orderdate,
+    o_shippriority
+FROM
+    customer,
+    orders,
+    lineitem
+WHERE
+    c_mktsegment = 'BUILDING'
+AND c_custkey = o_custkey
+AND l_orderkey = o_orderkey
+AND o_orderdate < DATE '1996-01-01'
+AND l_shipdate > DATE '1996-02-01'
+GROUP BY
+    l_orderkey,
+    o_orderdate,
+    o_shippriority
+ORDER BY
+    revenue DESC,
+    o_orderdate
+limit 10;
+```
+其中lineitem大概600w多点的数据，查询给出在指定日期之前尚未运送的订单中收入最高订单的优先权和潜在的收入，订单按照收入的降序列出，此查询将列出潜在查询收入在前10的尚未运送的订单，在未使用TiFlash加速的情况下查询耗时（explian analyze可查看select的查询计划）：
+![avatar](/assets/img/jan/sql-no-flash.png)
+点击数据可查看具体查询计划：
+![avatar](/assets/img/jan/sql-no-flash-plan.jpg)
+
+可以看到大概的查询时间在600+ms, 查询都在TiKV上，下面通过TiFlash来加速查询，从dashboard上看到已经部署了TiFlash，但部署完成并不会自动同步TiKV数据，在客户端执行sql，将数据同步到TiFlash后就可利用TiFlash优秀的查询性能来优化以上查询(**需要root权限**)：
+```sql
+ALTER TABLE test.customer SET TIFLASH REPLICA 1;
+ALTER TABLE test.orders SET TIFLASH REPLICA 1;
+ALTER TABLE test.lineitem SET TIFLASH REPLICA 1;
+```
+数据同步需要几秒时间，可通过
+```sql
+SELECT * FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA = 'test' and TABLE_NAME = 'customer';
+SELECT * FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA = 'test' and TABLE_NAME = 'orders';
+SELECT * FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA = 'test' and TABLE_NAME = 'lineitem';
+```
+查看各个表的同步进度，PROGRESS字段代表同步进度，在0.0~1.0之间，1代表TiFlash 副本已经完成同步，待以上三个表数据都同步完成后，再次执行查询sql，查看执行耗时，第一次查询耗时在400多ms，以后的查询基本上在100多ms，并且查询内存相比之前更小：
+![avatar](/assets/img/jan/sql-with-flash.jpg)
+
+查看执行计划：
+![avatar](/assets/img/jan/sql-with-flash-plan.jpg)
+可以看到用到了mmp，表示进行了优化加速查询
+
+用TiFalsh和纯用TiKV执行同一个sql的直观对比：
+![avatar](/assets/img/jan/select-compare.jpg)
+
+可以看到效果还是挺明显的。
+
+## 总结
+总的来说，TiDB可以为我们解决很多问题，比如：
+1. 支持海量数据，基本不用担心数据量上来，DB不够用问题。
+2. 本身集成了列式存储，可以很好的解决olap的场景，使用了TiDB后不需要在业务上引入额外的存储来满足数据分析需求。
